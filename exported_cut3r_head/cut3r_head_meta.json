@@ -1,0 +1,26 @@
+{
+  "head_type": "dpt",
+  "output_mode": "pts3d+pose",
+  "enc_embed_dim": 1024,
+  "dec_embed_dim": 768,
+  "dec_num_heads": 12,
+  "dec_depth": 12,
+  "depth_mode": [
+    "exp",
+    -Infinity,
+    Infinity
+  ],
+  "conf_mode": [
+    "exp",
+    1,
+    Infinity
+  ],
+  "pose_mode": [
+    "exp",
+    -Infinity,
+    Infinity
+  ],
+  "has_pose": true,
+  "has_rgb": true,
+  "has_conf": true
+}
