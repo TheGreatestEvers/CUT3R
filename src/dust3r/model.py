@@ -1100,6 +1100,335 @@ class ARCroco3DStereo(CroCoNet):
         return ress, views
 
 
+    ### FORECASTING ###
+    # ---------------------------------------------------------------------
+    # Helpers: pack CUT3R dec layers <-> Dino_f external features
+    # ---------------------------------------------------------------------
+    @staticmethod
+    def _pack_dec_layers_for_forecaster(dec_layers_seq):
+        """
+        dec_layers_seq: list over time of tuples
+            (l0, l2q, l3q, lfin), each [B, Sx, Dk]
+
+        Returns:
+            feats_ctx:   [B, T_ctx, S+1, C_tot]  (external-mode features)
+            spatial_len: int, S
+            per_layer_dims: (D0, D1, D2, D3)
+        """
+        assert len(dec_layers_seq) > 0, "Need at least one timestep for context"
+
+        l0_0, l2q_0, l3q_0, lfin_0 = dec_layers_seq[0]
+        B = l0_0.shape[0]
+
+        # Like the dataset: smallest token count across layers = spatial length
+        spatial_len = min(l0_0.shape[1], l2q_0.shape[1], l3q_0.shape[1], lfin_0.shape[1])
+
+        per_layer_dims = (
+            l0_0.shape[-1],
+            l2q_0.shape[-1],
+            l3q_0.shape[-1],
+            lfin_0.shape[-1],
+        )
+
+        feats_list = []
+        for (l0, l2q, l3q, lfin) in dec_layers_seq:
+            layer_tensors = [l0, l2q, l3q, lfin]
+            spatial_parts = []
+            pose_parts = []
+
+            for x in layer_tensors:
+                # x: [B, Sx, D]
+                Bx, Sx, D = x.shape
+                assert Bx == B, "Batch size mismatch across layers"
+
+                if Sx == spatial_len + 1:
+                    pose_k = x[:, 0, :]      # [B, D]
+                    spatial_k = x[:, 1:, :]  # [B, S, D]
+                elif Sx == spatial_len:
+                    spatial_k = x
+                    pose_k = x.new_zeros(B, D)
+                else:
+                    raise RuntimeError(
+                        f"Incompatible token length {Sx} for spatial_len={spatial_len}"
+                    )
+
+                spatial_parts.append(spatial_k)
+                pose_parts.append(pose_k)
+
+            # concat spatial along channel dim -> [B, S, 4*D]
+            spatial_concat = torch.cat(spatial_parts, dim=-1)
+            # concat pose tokens -> [B, 4*D] -> [B, 1, 4*D]
+            pose_concat = torch.cat(pose_parts, dim=-1).unsqueeze(1)
+
+            # prepend pose token -> [B, S+1, 4*D]
+            feats_t = torch.cat([pose_concat, spatial_concat], dim=1)
+            feats_list.append(feats_t)
+
+        # stack over time -> [B, T_ctx, S+1, 4*D]
+        feats_ctx = torch.stack(feats_list, dim=1)
+        return feats_ctx, spatial_len, per_layer_dims
+
+    @staticmethod
+    def _unpack_forecaster_frame_to_dec_layers(feats_t, spatial_len, per_layer_dims):
+        """
+        feats_t:       [B, S+1, C_tot]  (pose token + S spatial)
+        spatial_len:   S
+        per_layer_dims: (D0, D1, D2, D3)
+
+        Returns:
+            l0, l2q, l3q, lfin with shapes analogous to the original dec layers:
+              l0   : [B, S,   D0]          # no pose token (as in original)
+              l2q  : [B, S+1, D1]          # pose token at index 0
+              l3q  : [B, S+1, D2]
+              lfin : [B, S+1, D3]
+        """
+        B, S1, C_tot = feats_t.shape
+        assert S1 == spatial_len + 1, f"Got S1={S1}, expected {spatial_len+1}"
+
+        d0, d1, d2, d3 = per_layer_dims
+        assert d0 + d1 + d2 + d3 == C_tot, "Channel split mismatch"
+
+        pose_concat = feats_t[:, 0, :]      # [B, C_tot]
+        spat_concat = feats_t[:, 1:, :]     # [B, S, C_tot]
+
+        # Split channel-wise into four parts
+        pose0, pose1, pose2, pose3 = torch.split(pose_concat, per_layer_dims, dim=-1)
+        spat0, spat1, spat2, spat3 = torch.split(spat_concat, per_layer_dims, dim=-1)
+
+        # l0: no pose token in original pipeline
+        l0 = spat0                            # [B, S, D0]
+
+        # l2q / l3q / lfin: pose token at index 0
+        l2q  = torch.cat([pose1.unsqueeze(1), spat1], dim=1)  # [B, S+1, D1]
+        l3q  = torch.cat([pose2.unsqueeze(1), spat2], dim=1)  # [B, S+1, D2]
+        lfin = torch.cat([pose3.unsqueeze(1), spat3], dim=1)  # [B, S+1, D3]
+
+        return l0, l2q, l3q, lfin
+
+    @staticmethod
+    def _run_forecaster_unroll(forecaster, feats_ctx, num_future, mask_frames=1):
+        """
+        Simple autoregressive unroll using Dino_f internals.
+
+        Args:
+            forecaster:  Dino_f instance (feature_extractor='external', pose_token_mode=True)
+            feats_ctx:   [B, T_ctx, S+1, C_feat]  (raw external features)
+            num_future:  how many future frames to predict
+
+        Returns:
+            future_feats: [B, num_future, S+1, C_feat] in raw external feature space
+        """
+        device = feats_ctx.device
+        B, T_ctx, S1, C_feat = feats_ctx.shape
+
+        seq_len = forecaster.sequence_length
+        assert T_ctx <= seq_len, "Context length must be <= forecaster.sequence_length"
+
+        # Build initial rolling window of length seq_len
+        if T_ctx == seq_len:
+            window = feats_ctx.clone()             # [B, seq_len, S+1, C]
+        else:
+            # Pad with copies of last context frame
+            pad_frames = seq_len - T_ctx
+            last = feats_ctx[:, -1:]              # [B, 1, S+1, C]
+            pad = last.expand(B, pad_frames, S1, C_feat)
+            window = torch.cat([feats_ctx, pad], dim=1)
+
+        future_list = []
+        forecaster.eval()
+        with torch.no_grad():
+            for _ in range(num_future):
+                # Preprocess to internal [B, seq_len, H, W, C_emb]
+                x_pre = forecaster.preprocess(window)   # external mode
+
+                # Mask ONLY the last frame in the window
+                masked_x, mask = forecaster.get_mask_tokens(
+                    x_pre, mode="full_mask", mask_frames=mask_frames
+                )
+                mask = mask.to(x_pre.device)
+
+                # Run transformer
+                _, x_pred = forecaster.forward(x_pre, masked_x, mask)
+
+                # Back to original external feature space
+                x_pred_orig = forecaster.postprocess(x_pred)   # [B, seq_len, H, W, C_feat]
+                last_pred = x_pred_orig[:, -1]                 # [B, H, W, C_feat]
+
+                # Convert [B, H=1, W=S1, C] -> [B, S1, C]
+                BT, H_, W_, C_ = last_pred.shape
+                assert BT == B and H_ * W_ == S1, \
+                    f"Unexpected pred shape {last_pred.shape}, expected H*W={S1}"
+                last_tokens = last_pred.view(B, S1, C_)        # [B, S+1, C_feat]
+
+                future_list.append(last_tokens)
+
+                # Slide window: drop first, append prediction
+                window = torch.cat(
+                    [window[:, 1:], last_tokens.unsqueeze(1)], dim=1
+                )
+
+        return torch.stack(future_list, dim=1)   # [B, num_future, S+1, C_feat]
+
+    # ---------------------------------------------------------------------
+    # Custom forward: CUT3R + Dino_f forecaster
+    # ---------------------------------------------------------------------
+    def forward_with_forecaster(self, views, forecaster, context_len=4):
+        """
+        Hybrid forward:
+          - first context_len timesteps: standard CUT3R recurrent pipeline
+          - subsequent timesteps: Dino_f forecasts head inputs from the context,
+            we map them back to 4-layer head inputs and run the CUT3R head.
+
+        Assumes:
+          - forecaster is a Dino_f with external features + pose_token_mode=True
+          - forecaster.sequence_length == context_len (simplest setup)
+          - len(views) >= context_len
+        """
+        if isinstance(views, dict):
+            views = [views]
+
+        num_views = len(views)
+        assert context_len <= num_views, "context_len cannot exceed number of views"
+
+        # Encode ALL views once to get encoder features + positions
+        shapes, feat_ls, pos = self._encode_views(views)
+        feat = feat_ls[-1]  # last encoder level
+        state_feat, state_pos = self._init_state(feat[0], pos[0])
+        mem = self.pose_retriever.mem.expand(feat[0].shape[0], -1, -1)
+        init_state_feat = state_feat.clone()
+        init_mem = mem.clone()
+
+        B = feat[0].shape[0]
+
+        ress = []
+        ctx_dec_layers = []   # to feed forecaster (l0, l2q, l3q, lfin) for each t < context_len
+
+        # ------------------- 1) RUN STANDARD CUT3R FOR CONTEXT -------------------
+        for i in range(num_views):
+            feat_i = feat[i]
+            pos_i = pos[i]
+
+            if self.pose_head_flag:
+                global_img_feat_i = self._get_img_level_feat(feat_i)
+                if i == 0:
+                    pose_feat_i = self.pose_token.expand(feat_i.shape[0], -1, -1)
+                else:
+                    pose_feat_i = self.pose_retriever.inquire(global_img_feat_i, mem)
+                pose_pos_i = -torch.ones(
+                    feat_i.shape[0], 1, 2, device=feat_i.device, dtype=pos_i.dtype
+                )
+            else:
+                global_img_feat_i = None
+                pose_feat_i = None
+                pose_pos_i = None
+
+            # Run recurrent decoder step
+            new_state_feat, dec = self._recurrent_rollout(
+                state_feat,
+                state_pos,
+                feat_i,
+                pos_i,
+                pose_feat_i,
+                pose_pos_i,
+                init_state_feat,
+                img_mask=views[i]["img_mask"],
+                reset_mask=views[i]["reset"],
+                update=views[i].get("update", None),
+            )
+
+            # Update local pose memory
+            out_pose_feat_i = dec[-1][:, 0:1]
+            new_mem = self.pose_retriever.update_mem(
+                mem, global_img_feat_i, out_pose_feat_i
+            )
+
+            # Head input as usual
+            head_input = [
+                dec[0].float(),
+                dec[self.dec_depth * 2 // 4][:, 1:].float(),
+                dec[self.dec_depth * 3 // 4][:, 1:].float(),
+                dec[self.dec_depth].float(),
+            ]
+            res = self._downstream_head(head_input, shapes[i], pos=pos_i)
+
+            ress.append(res)
+
+            # Save full 4 dec layers for context frames ONLY
+            if i < context_len:
+                l0_full   = dec[0].float()
+                l2q_full  = dec[self.dec_depth * 2 // 4].float()
+                l3q_full  = dec[self.dec_depth * 3 // 4].float()
+                lfin_full = dec[self.dec_depth].float()
+                ctx_dec_layers.append((l0_full, l2q_full, l3q_full, lfin_full))
+
+            # Update global state & memory (as usual)
+            img_mask = views[i]["img_mask"]
+            update = views[i].get("update", None)
+            if update is not None:
+                update_mask = img_mask & update
+            else:
+                update_mask = img_mask
+            update_mask = update_mask[:, None, None].float()
+
+            state_feat = new_state_feat * update_mask + state_feat * (1 - update_mask)
+            mem = new_mem * update_mask + mem * (1 - update_mask)
+
+            reset_mask = views[i]["reset"]
+            if reset_mask is not None:
+                reset_mask = reset_mask[:, None, None].float()
+                state_feat = init_state_feat * reset_mask + state_feat * (1 - reset_mask)
+                mem = init_mem * reset_mask + mem * (1 - reset_mask)
+
+            # After context_len frames we will switch to forecaster
+            if i + 1 == context_len:
+                break
+
+        # If there are no future timesteps, we're done
+        if context_len >= num_views:
+            return ARCroco3DStereoOutput(ress=ress, views=views)
+
+        # ------------------- 2) PACK CONTEXT FOR DINO_f -------------------
+        feats_ctx, spatial_len, per_layer_dims = self._pack_dec_layers_for_forecaster(
+            ctx_dec_layers
+        )  # feats_ctx: [B, context_len, S+1, 4*D]
+
+        # ------------------- 3) FORECAST FUTURE HEAD INPUT FEATURES -------------------
+        num_future = num_views - context_len
+        future_feats = self._run_forecaster_unroll(
+            forecaster,
+            feats_ctx,      # [B, T_ctx, S+1, C]
+            num_future=num_future,
+            mask_frames=1,  # mask last frame only
+        )  # -> [B, num_future, S+1, C]
+
+        # ------------------- 4) MAP PREDICTED FEATURES BACK INTO HEAD INPUT -------------------
+        for j in range(num_future):
+            t_idx = context_len + j
+
+            feats_t = future_feats[:, j]  # [B, S+1, C_tot]
+            l0_pred, l2q_pred, l3q_pred, lfin_pred = \
+                self._unpack_forecaster_frame_to_dec_layers(
+                    feats_t, spatial_len, per_layer_dims
+                )
+
+            # Build head input analogous to the standard path
+            head_input_pred = [
+                l0_pred.float(),
+                l2q_pred[:, 1:].float(),
+                l3q_pred[:, 1:].float(),
+                lfin_pred.float(),
+            ]
+
+            res_pred = self._downstream_head(
+                head_input_pred,
+                shapes[t_idx],   # spatial shape for that real frame
+                pos=pos[t_idx],  # encoder positions for that frame
+            )
+            ress.append(res_pred)
+
+        return ARCroco3DStereoOutput(ress=ress, views=views)
+
+
 if __name__ == "__main__":
     print(ARCroco3DStereo.mro())
     cfg = ARCroco3DStereoConfig(
