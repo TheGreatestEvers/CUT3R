@@ -182,6 +182,15 @@ def eval_metrics(pred_traj, gt_traj=None, seq="", filename="", sample_stride=1):
             print(pred_traj.timestamps.shape[0], gt_traj.timestamps.shape[0])
 
         gt_traj, pred_traj = sync.associate_trajectories(gt_traj, pred_traj)
+    
+    #plot_trajectory(
+    #        pred_traj,
+    #        gt_traj,
+    #        title="gt and pred",
+    #        filename="/workspace/CUT3R/trajectories.png",
+    #        align=True,
+    #        correct_scale=True,
+    #    )
 
     # ATE
     traj_ref = gt_traj
@@ -244,7 +253,7 @@ def eval_metrics(pred_traj, gt_traj=None, seq="", filename="", sample_stride=1):
         f.write(f"{rpe_rots_result}")
         f.write(f"{rpe_transs_result}")
 
-    print(f"Save results to {filename}")
+    #print(f"Save results to {filename}")
     return ate, rpe_trans, rpe_rot
 
 
