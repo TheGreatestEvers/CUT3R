@@ -199,16 +199,16 @@ if __name__ == "__main__":
 
     # ----- paths -----
     waymo_dir = "/workspace/raid/jevers/cut3r_processed_waymo/validation"
-    feature_dir = "/workspace/raid/jevers/cut3r_features/waymo/fused_img_tokens_224/validation"
+    feature_dir = "/workspace/raid/jevers/cut3r_features/waymo/fused_img_tokens_512/validation"
 
     # ----- dataset & sampler -----
     from dust3r.datasets.waymo import Waymo_Multi_TStride
     waymo_ds = Waymo_Multi_TStride(
         num_views=7,
-        resolution=224,
+        resolution=(512, 336),
         ROOT=waymo_dir,
         temporal_stride=2,
-        overlap_step=5,
+        non_overlapping=True
     )
 
     # This splits the dataset over world_size processes
@@ -223,7 +223,7 @@ if __name__ == "__main__":
         waymo_ds,
         batch_size=16,
         sampler=sampler,          # <- important: no shuffle when using sampler
-        num_workers=4,            # you can bump this up to better feed the GPUs
+        num_workers=0,            # you can bump this up to better feed the GPUs
         pin_memory=True,
         drop_last=False,
     )

@@ -1272,17 +1272,27 @@ class ARCroco3DStereo(CroCoNet):
     # ---------------------------------------------------------------------
     # Custom forward: CUT3R + Dino_f forecaster
     # ---------------------------------------------------------------------
-    def forward_with_forecaster(self, views, forecaster, context_len=4):
+    def forward_with_forecaster(
+        self,
+        views,
+        forecaster=None,
+        context_len: int = 4,
+        mode: str = "forecast",
+    ):
         """
-        Hybrid forward:
-          - first context_len timesteps: standard CUT3R recurrent pipeline
-          - subsequent timesteps: Dino_f forecasts head inputs from the context,
-            we map them back to 4-layer head inputs and run the CUT3R head.
+        Hybrid forward with optional baselines.
 
-        Assumes:
-          - forecaster is a Dino_f with external features + pose_token_mode=True
-          - forecaster.sequence_length == context_len (simplest setup)
-          - len(views) >= context_len
+        Args:
+            views: list[dict] or dict of CUT3R views.
+            forecaster: Dino_f instance (needed for mode='forecast').
+            context_len: number of initial timesteps to run with standard CUT3R.
+            mode:
+                - "forecast": use Dino_f to predict frames >= context_len
+                - "oracle":   ignore forecaster, run standard recurrent forward
+                              over all views (no forecasting)
+                - "copy_last": run recurrent up to context_len-1, then simply
+                               repeat the last context 3D prediction for the
+                               remaining timesteps.
         """
         if isinstance(views, dict):
             views = [views]
@@ -1290,9 +1300,15 @@ class ARCroco3DStereo(CroCoNet):
         num_views = len(views)
         assert context_len <= num_views, "context_len cannot exceed number of views"
 
-        # Encode ALL views once to get encoder features + positions
-        shapes, feat_ls, pos = self._encode_views(views)
+        # ---- ORACLE: just run standard CUT3R forward on all views ----
+        if mode == "oracle":
+            # this gives you the usual baseline: no forecasting at all
+            return self.forward(views)
+
+        # ------------------- encode all views once -------------------
+        shape, feat_ls, pos = self._encode_views(views)
         feat = feat_ls[-1]  # last encoder level
+
         state_feat, state_pos = self._init_state(feat[0], pos[0])
         mem = self.pose_retriever.mem.expand(feat[0].shape[0], -1, -1)
         init_state_feat = state_feat.clone()
@@ -1301,7 +1317,8 @@ class ARCroco3DStereo(CroCoNet):
         B = feat[0].shape[0]
 
         ress = []
-        ctx_dec_layers = []   # to feed forecaster (l0, l2q, l3q, lfin) for each t < context_len
+        ctx_dec_layers = []   # to feed forecaster (for mode='forecast')
+        last_ctx_res = None   # for copy_last baseline
 
         # ------------------- 1) RUN STANDARD CUT3R FOR CONTEXT -------------------
         for i in range(num_views):
@@ -1349,11 +1366,12 @@ class ARCroco3DStereo(CroCoNet):
                 dec[self.dec_depth * 3 // 4][:, 1:].float(),
                 dec[self.dec_depth].float(),
             ]
-            res = self._downstream_head(head_input, shapes[i], pos=pos_i)
+            res = self._downstream_head(head_input, shape[i], pos=pos_i)
 
             ress.append(res)
+            last_ctx_res = res  # remember last context prediction
 
-            # Save full 4 dec layers for context frames ONLY
+            # Save full 4 dec layers for context frames ONLY (for the forecaster mode)
             if i < context_len:
                 l0_full   = dec[0].float()
                 l2q_full  = dec[self.dec_depth * 2 // 4].float()
@@ -1379,7 +1397,7 @@ class ARCroco3DStereo(CroCoNet):
                 state_feat = init_state_feat * reset_mask + state_feat * (1 - reset_mask)
                 mem = init_mem * reset_mask + mem * (1 - reset_mask)
 
-            # After context_len frames we will switch to forecaster
+            # After context_len frames we will switch to baseline / forecaster
             if i + 1 == context_len:
                 break
 
@@ -1387,21 +1405,34 @@ class ARCroco3DStereo(CroCoNet):
         if context_len >= num_views:
             return ARCroco3DStereoOutput(ress=ress, views=views)
 
-        # ------------------- 2) PACK CONTEXT FOR DINO_f -------------------
+        num_future = num_views - context_len
+
+        # ------------------- 2a) COPY-LAST BASELINE -------------------
+        if mode == "copy_last":
+            assert last_ctx_res is not None, "No context prediction to copy from."
+            for _ in range(num_future):
+                # deepcopy to avoid any accidental in-place changes affecting all timesteps
+                ress.append(deepcopy(last_ctx_res))
+            return ARCroco3DStereoOutput(ress=ress, views=views)
+
+        # ------------------- 2b) FORECAST MODE (Dino_f) -------------------
+        assert mode == "forecast", f"Unknown mode '{mode}'"
+        assert forecaster is not None, "forecaster must be provided for mode='forecast'"
+
+        # Pack context dec layers into external feature format
         feats_ctx, spatial_len, per_layer_dims = self._pack_dec_layers_for_forecaster(
             ctx_dec_layers
-        )  # feats_ctx: [B, context_len, S+1, 4*D]
+        )  # feats_ctx: [B, context_len, S+1, C_tot]
 
-        # ------------------- 3) FORECAST FUTURE HEAD INPUT FEATURES -------------------
-        num_future = num_views - context_len
+        # Predict future head inputs
         future_feats = self._run_forecaster_unroll(
             forecaster,
-            feats_ctx,      # [B, T_ctx, S+1, C]
+            feats_ctx,           # [B, T_ctx, S+1, C_tot]
             num_future=num_future,
-            mask_frames=1,  # mask last frame only
-        )  # -> [B, num_future, S+1, C]
+            mask_frames=1,       # mask last frame only
+        )  # -> [B, num_future, S+1, C_tot]
 
-        # ------------------- 4) MAP PREDICTED FEATURES BACK INTO HEAD INPUT -------------------
+        # Map predicted features back into CUT3R head inputs
         for j in range(num_future):
             t_idx = context_len + j
 
@@ -1411,7 +1442,6 @@ class ARCroco3DStereo(CroCoNet):
                     feats_t, spatial_len, per_layer_dims
                 )
 
-            # Build head input analogous to the standard path
             head_input_pred = [
                 l0_pred.float(),
                 l2q_pred[:, 1:].float(),
@@ -1421,8 +1451,8 @@ class ARCroco3DStereo(CroCoNet):
 
             res_pred = self._downstream_head(
                 head_input_pred,
-                shapes[t_idx],   # spatial shape for that real frame
-                pos=pos[t_idx],  # encoder positions for that frame
+                shape[t_idx],   # spatial shape for that real frame
+                pos=pos[t_idx], # encoder positions for that frame
             )
             ress.append(res_pred)
 

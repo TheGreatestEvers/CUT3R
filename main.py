@@ -130,25 +130,31 @@ def run_inference_with_forecast(cut3r_model: ARCroco3DStereo, forecaster, views,
     print("Running inference...")
     start_time = time.time()
 
-    # standard cut3r    
-    # outputs, state_args = inference(views, model, device)
+    oracle=False
+    if oracle: 
+        #standard cut3r    
+        from dust3r.inference import inference
+        outputs, state_args = inference(views, cut3r_model, device)
+    else:
     # Move views to cuda
-    ignore_keys = set(
-        ["depthmap", "dataset", "label", "instance", "idx", "rng"] # removed "true_shape"
-    )
-    for view in views:
-        for name in view.keys():  # pseudo_focal
-            if name in ignore_keys:
-                continue
-            if isinstance(view[name], tuple) or isinstance(view[name], list):
-                view[name] = [x.to(device, non_blocking=True) for x in view[name]]
-            else:
-                view[name] = view[name].to(device, non_blocking=True)
+        ignore_keys = set(
+            ["depthmap", "dataset", "label", "instance", "idx", "rng"] # removed "true_shape"
+        )
+        for view in views:
+            for name in view.keys():  # pseudo_focal
+                if name in ignore_keys:
+                    continue
+                if isinstance(view[name], tuple) or isinstance(view[name], list):
+                    view[name] = [x.to(device, non_blocking=True) for x in view[name]]
+                else:
+                    view[name] = view[name].to(device, non_blocking=True)
+        
+        # Inference
+        output = cut3r_model.forward_with_forecaster(views, forecaster, context_len=4)
+        preds, batch = output.ress, output.views
+        outputs = dict(views=batch, pred=preds)
     
-    # Inference
-    output, state_args = model.forward_with_forecaster(views, forecaster, context_len=4)
-    preds, batch = output.ress, output.views
-    outputs = dict(views=batch, pred=preds)
+    #torch.save(outputs, "inference_outputs_2.pt")
 
     total_time = time.time() - start_time
     print(
@@ -173,8 +179,8 @@ def run_inference_with_forecast(cut3r_model: ARCroco3DStereo, forecaster, views,
     # Create and run the point cloud viewer.
     print("Launching point cloud viewer...")
     viewer = PointCloudViewer(
-        model,
-        state_args,
+        cut3r_model,
+        None, #state_args
         pts3ds_to_vis,
         colors_to_vis,
         conf,
@@ -189,8 +195,17 @@ def run_inference_with_forecast(cut3r_model: ARCroco3DStereo, forecaster, views,
     viewer.run()
 
 if __name__ == "__main__":
+
+    import imageio
+    img = imageio.imread("/workspace/raid/jevers/cut3r_processed_waymo/validation_full_res_depth/validation/segment-9443948810903981522_6538_870_6558_870_with_camera_labels.tfrecord/00000_1.exr")
+    height, width = img.shape[:2]
+    print(f"Resolution: {width} x {height}")
+    assert False
+
     from dust3r.datasets.waymo import Waymo_Multi_TStride
-    from src.helpers import batchify_sample_for_cut3r
+    from src.helpers import batchify_sample_for_cut3r, save_waymo_dataset_sample_gif
+    sys.path.append("/workspace/DINO-Foresight")
+    from src.dino_f import Dino_f
 
     waymo_val_ds = Waymo_Multi_TStride(
         num_views=7,
@@ -200,16 +215,20 @@ if __name__ == "__main__":
         overlap_step=5,
     )
     
-    sample = waymo_val_ds[479]
-    batch = batchify_per_view_like_you_want(sample)
+    # cool idx:
+    # 2000
+    # 2790
+    # 2795
+    idx = 2795
+    sample = waymo_val_ds[idx]
+    batch = batchify_sample_for_cut3r(sample)
 
-    cut3r_model = ARCroco3DStereo.from_pretrained("/workspace/cut3r-forecasting/cut3r_512_dpt_4_64.pth").to("cuda")
+    save_waymo_dataset_sample_gif(waymo_val_ds, idx)
+    cut3r_model = ARCroco3DStereo.from_pretrained("/workspace/CUT3R/cut3r_512_dpt_4_64.pth").to("cuda")
     cut3r_model.eval()
-
-    sys.path.append("/workspace/DINO-Foresight")
-    from dino_f import Dino_f
+    
     args = torch.load("/workspace/DINO-Foresight/args.pt")
-    dinof_model = Dino_f.load_from_checkpoint(ckpt_path, args=args, strict=False, map_location="cpu")
+    dinof_model = Dino_f.load_from_checkpoint("/workspace/epoch=78-step=37288-val_loss=0.00000.ckpt", args=args, strict=False, map_location="cpu")
     dinof_model.to(args.device).eval()
 
 
