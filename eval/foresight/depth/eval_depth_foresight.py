@@ -64,7 +64,10 @@ def parse_args():
         "--output_metrics",
         type=str,
         default=None,
-        help="Optional JSON file to save aggregated metrics",
+        help=(
+            "Optional JSON file to save aggregated metrics per process "
+            "(rank will be appended automatically in multi-GPU mode)."
+        ),
     )
 
     return parser.parse_args()
@@ -96,7 +99,8 @@ def get_horizon_indices(context_len: int, seq_len: int, horizon_mode: str):
         return [forecast_indices[-1]]
     else:
         raise ValueError(f"Unknown horizon_mode: {horizon_mode}")
-    
+
+
 def depth_from_outputs(outputs) -> np.ndarray:
     """
     Extract depth sequence [T, H, W] from a saved outputs dict
@@ -109,19 +113,43 @@ def depth_from_outputs(outputs) -> np.ndarray:
     return depth.numpy()
 
 
+def get_rank_and_world_size():
+    """Helper to read torchrun env vars, default to single process."""
+    rank = int(os.environ.get("RANK", 0))
+    world_size = int(os.environ.get("WORLD_SIZE", 1))
+    local_rank = int(os.environ.get("LOCAL_RANK", rank))
+    return rank, world_size, local_rank
+
+
 def main():
     args = parse_args()
 
-    pred_root = Path(args.pred_root)
-    seq_files = sorted(pred_root.glob("*/*.pt"))
+    # ---- Multi-GPU device selection (torchrun-compatible) ----
+    rank, world_size, local_rank = get_rank_and_world_size()
+    if torch.cuda.is_available():
+        device = torch.device(f"cuda:{local_rank}")
+        torch.cuda.set_device(device)
+    else:
+        device = torch.device("cpu")
+    print(f"[Rank {rank}/{world_size}] Using device: {device}")
 
-    if len(seq_files) == 0:
-        print(f"No seq_*.npz files found under {pred_root}")
+    pred_root = Path(args.pred_root)
+    all_seq_files = sorted(pred_root.glob("/.pt"))
+
+    if len(all_seq_files) == 0:
+        print(f"[Rank {rank}] No seq_*.pt files found under {pred_root}")
         return
+
+    # ---- Multi-GPU sharding over sequences ----
+    seq_files = all_seq_files[rank::world_size]
+    print(
+        f"[Rank {rank}] Evaluating {len(seq_files)} / {len(all_seq_files)} sequences "
+        f"(indices {list(range(rank, len(all_seq_files), world_size))})"
+    )
 
     gathered_metrics = []
 
-    for pt_path in tqdm(seq_files, desc="Sequences"):
+    for pt_path in tqdm(seq_files, desc=f"Sequences (rank {rank})"):
         data = torch.load(pt_path, map_location="cpu")
 
         outputs = data["outputs"]
@@ -163,21 +191,18 @@ def main():
         eval_indices = get_horizon_indices(context_len, seq_len, args.horizon_mode)
 
         pr_eval = pr_depth_resized[eval_indices]  # [T_eval, H, W]
-        gt_eval = gt_depth[eval_indices]  # [T_eval, H, W
+        gt_eval = gt_depth[eval_indices]  # [T_eval, H, W]
 
         # 4) Call depth_evaluation with appropriate alignment options
         align_with_lad2 = args.align == "scale&shift"
         align_with_scale = args.align == "scale"
         metric_scale = args.align == "metric"
 
-        print("gt shape: ", gt_eval.shape)
-        assert False
-
         results, error_map, depth_pred_full, depth_gt_full = depth_evaluation(
             pr_eval,
             gt_eval,
             max_depth=args.max_depth,
-            use_gpu=True,
+            use_gpu=torch.cuda.is_available(),
             align_with_lad2=align_with_lad2,
             align_with_scale=align_with_scale,
             metric_scale=metric_scale,
@@ -186,10 +211,10 @@ def main():
         gathered_metrics.append(results)
 
     if len(gathered_metrics) == 0:
-        print("No metrics computed.")
+        print(f"[Rank {rank}] No metrics computed.")
         return
 
-    # 5) Aggregate metrics using valid_pixels as weights, like in their code
+    # 5) Aggregate metrics using valid_pixels as weights (per rank)
     valid_pixels_list = [m["valid_pixels"] for m in gathered_metrics]
 
     avg_metrics = {
@@ -202,14 +227,17 @@ def main():
     }
 
     print(
-        f"\nAggregated depth metrics for horizon_mode={args.horizon_mode}, "
-        f"align={args.align}:"
+        f"\n[Rank {rank}] Aggregated depth metrics for "
+        f"horizon_mode={args.horizon_mode}, align={args.align}:"
     )
     for k, v in avg_metrics.items():
-        print(f"  {k}: {v:.6f}")
+        print(f"[Rank {rank}]   {k}: {v:.6f}")
 
+    # Optionally save per-rank metrics; you can merge them later
     if args.output_metrics is not None:
-        out_path = Path(args.output_metrics)
+        base = Path(args.output_metrics)
+        # append rank so processes don't clobber each other
+        out_path = base.with_name(base.stem + f"_rank{rank}" + base.suffix)
         out_path.parent.mkdir(parents=True, exist_ok=True)
         with open(out_path, "w") as f:
             json.dump(
@@ -218,11 +246,14 @@ def main():
                     "horizon_mode": args.horizon_mode,
                     "align": args.align,
                     "max_depth": args.max_depth,
+                    "rank": rank,
+                    "world_size": world_size,
                     "metrics": avg_metrics,
                 },
                 f,
                 indent=2,
             )
+        print(f"[Rank {rank}] Saved metrics to {out_path}")
 
 
 if __name__ == "__main__":

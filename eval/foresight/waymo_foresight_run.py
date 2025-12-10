@@ -31,15 +31,22 @@ def parse_args():
     parser.add_argument(
         "--waymo_root",
         type=str,
-        default="/workspace/raid/jevers/cut3r_processed_waymo/validation_full_res_depth/validation",
+        default="/workspace/raid/jevers/cut3r_processed_waymo/validation_full_res_depth/",
         help="Waymo root directory containing segment subfolders",
     )
 
     parser.add_argument(
         "--output_dir",
         type=str,
-        default="/workspace/raid/jevers/waymo_outputs",
+        required=True,
         help="Directory where predicted sequences + metadata will be saved",
+    )
+
+    parser.add_argument(
+        "--mode",
+        type=str,
+        default="forecast",
+        choices=["forecast", "copy_last", "oracle"]
     )
 
     # Sequence config
@@ -154,22 +161,37 @@ def extract_depth_from_outputs(outputs):
     return depth  # [T, H, W]
 
 
+def get_rank_and_world_size():
+    """Helper to read torchrun env vars, default to single process."""
+    rank = int(os.environ.get("RANK", 0))
+    world_size = int(os.environ.get("WORLD_SIZE", 1))
+    local_rank = int(os.environ.get("LOCAL_RANK", rank))
+    return rank, world_size, local_rank
+
+
 def main():
     args = parse_args()
     os.makedirs(args.output_dir, exist_ok=True)
 
-    # Simple single-device setup
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
+    # ---- Multi-GPU device selection (torchrun-compatible) ----
+    rank, world_size, local_rank = get_rank_and_world_size()
+    if torch.cuda.is_available():
+        device = torch.device(f"cuda:{local_rank}")
+        torch.cuda.set_device(device)
+    else:
+        device = torch.device("cpu")
+    print(f"[Rank {rank}/{world_size}] Using device: {device}")
 
     # Load models
-    print("Loading CUT3R model...")
+    if rank == 0:
+        print("Loading CUT3R model...")
     cut3r_model = ARCroco3DStereo.from_pretrained(
         "/workspace/CUT3R/cut3r_512_dpt_4_64.pth"
     ).to(device)
     cut3r_model.eval()
 
-    print("Loading Dino_f model...")
+    if rank == 0:
+        print("Loading Dino_f model...")
     args_dinof = torch.load("/workspace/DINO-Foresight/args.pt")
     dinof_model = Dino_f.load_from_checkpoint(
         "/workspace/epoch=87-step=59136-val_loss=0.00000.ckpt",
@@ -179,28 +201,38 @@ def main():
     )
     dinof_model.to(device).eval()
 
-    # List all segments (single process)
-    segments = list_segments(args.waymo_root)
-    print(f"Found {len(segments)} segments.")
+    # List all segments (single global list, then shard by rank)
+    all_segments = list_segments(args.waymo_root)
+    if rank == 0:
+        print(f"Found {len(all_segments)} total segments.")
 
-    for seg_dir in tqdm(segments, desc="Segments"):
+    # ---- Multi-GPU sharding: each rank processes a slice of segments ----
+    segments = all_segments[rank::world_size]
+    print(
+        f"[Rank {rank}] Processing {len(segments)} / {len(all_segments)} segments "
+        f"(indices {list(range(rank, len(all_segments), world_size))})"
+    )
+
+    for seg_dir in tqdm(segments, desc=f"Segments (rank {rank})"):
         seg_name = os.path.basename(seg_dir)
         frames = list_front_camera_frames(seg_dir)
         if len(frames) == 0:
-            print(f"Warning: no frames found for segment {seg_name}")
+            print(f"[Rank {rank}] Warning: no frames found for segment {seg_name}")
             continue
 
         sequences = make_sequences(
             frame_list=frames, seq_len=args.seq_len, stride=args.stride
         )
         if len(sequences) == 0:
-            print(f"Warning: no valid sequences in segment {seg_name}")
+            print(f"[Rank {rank}] Warning: no valid sequences in segment {seg_name}")
             continue
 
         seg_out_dir = Path(args.output_dir) / seg_name
         seg_out_dir.mkdir(parents=True, exist_ok=True)
 
-        for seq in tqdm(sequences, desc=f"Sequences in {seg_name}", leave=False):
+        for seq in tqdm(
+            sequences, desc=f"Sequences in {seg_name} (rank {rank})", leave=False
+        ):
             # seq: list of (frame_idx, rgb_path)
             start_frame_idx = seq[0][0]
             img_paths = [str(p) for (_, p) in seq]
@@ -208,12 +240,9 @@ def main():
             # Prepare views for CUT3R
             views = prepare_views(img_paths, size=args.img_size, device=device)
 
-            print(views[0]["img"].shape)
-            assert False
-
             with torch.no_grad():
                 output = cut3r_model.forward_with_forecaster(
-                    views, dinof_model, context_len=args.context_len
+                    views, dinof_model, context_len=args.context_len, mode=args.mode
                 )
 
             preds, batch = output.ress, output.views
@@ -233,7 +262,8 @@ def main():
             out_path = seg_out_dir / f"seq_{start_frame_idx:05d}.pt"
             torch.save(save_dict, out_path)
 
-    print("Done.")
+    if rank == 0:
+        print("Done.")
 
 
 if __name__ == "__main__":
