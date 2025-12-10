@@ -8,6 +8,7 @@ import numpy as np
 import cv2
 from tqdm import tqdm
 import torch
+import torch.distributed as dist
 
 # Add repo root
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
@@ -27,13 +28,13 @@ def parse_args():
     parser.add_argument(
         "--waymo_root",
         type=str,
-        default="/workspace/raid/jevers/cut3r_processed_waymo/validation_full_res_depth/validation",
+        default="/workspace/raid/jevers/cut3r_processed_waymo/validation_full_res_depth",
         help="Waymo root (not strictly needed yet, but kept for symmetry)",
     )
     parser.add_argument(
         "--pred_root",
         type=str,
-        default="/workspace/raid/jevers/waymo_outputs",
+        default="/workspace/raid/jevers/waymo_outputs/forecast_224",
         help="Root where predictions are stored (output_dir from run script)",
     )
 
@@ -64,10 +65,7 @@ def parse_args():
         "--output_metrics",
         type=str,
         default=None,
-        help=(
-            "Optional JSON file to save aggregated metrics per process "
-            "(rank will be appended automatically in multi-GPU mode)."
-        ),
+        help="Optional JSON file to save aggregated metrics (single file, rank 0 only)",
     )
 
     return parser.parse_args()
@@ -101,12 +99,11 @@ def get_horizon_indices(context_len: int, seq_len: int, horizon_mode: str):
         raise ValueError(f"Unknown horizon_mode: {horizon_mode}")
 
 
-def depth_from_outputs(outputs) -> np.ndarray:
+def depth_from_outputs(preds) -> np.ndarray:
     """
-    Extract depth sequence [T, H, W] from a saved outputs dict
-    (returned by dust3r.inference and stored in the .pt file).
+    Extract depth sequence [T, H, W] from a saved preds list
+    (stored in the .pt file).
     """
-    preds = outputs["pred"]  # list of per-view dicts
     pts3ds_self = [pred["pts3d_in_self_view"].cpu() for pred in preds]
     pts3ds_self = torch.cat(pts3ds_self, dim=0)  # [T, H, W, 3]
     depth = pts3ds_self[..., -1]  # z coordinate, [T, H, W]
@@ -121,11 +118,19 @@ def get_rank_and_world_size():
     return rank, world_size, local_rank
 
 
+def maybe_init_distributed(world_size):
+    if world_size > 1 and not dist.is_initialized():
+        # gloo is fine even when using GPUs & allows gather_object
+        dist.init_process_group(backend="gloo")
+
+
 def main():
     args = parse_args()
 
     # ---- Multi-GPU device selection (torchrun-compatible) ----
     rank, world_size, local_rank = get_rank_and_world_size()
+    maybe_init_distributed(world_size)
+
     if torch.cuda.is_available():
         device = torch.device(f"cuda:{local_rank}")
         torch.cuda.set_device(device)
@@ -134,10 +139,12 @@ def main():
     print(f"[Rank {rank}/{world_size}] Using device: {device}")
 
     pred_root = Path(args.pred_root)
-    all_seq_files = sorted(pred_root.glob("/.pt"))
+    # FIXED: pattern should not start with '/'
+    all_seq_files = sorted(pred_root.glob("*/*.pt"))
 
     if len(all_seq_files) == 0:
         print(f"[Rank {rank}] No seq_*.pt files found under {pred_root}")
+        # All ranks can safely exit
         return
 
     # ---- Multi-GPU sharding over sequences ----
@@ -152,7 +159,7 @@ def main():
     for pt_path in tqdm(seq_files, desc=f"Sequences (rank {rank})"):
         data = torch.load(pt_path, map_location="cpu")
 
-        outputs = data["outputs"]
+        preds = data["preds"]
         segment = str(data["segment"])
         start_frame_idx = int(data["start_frame_idx"])
         stride = int(data["stride"])
@@ -162,7 +169,7 @@ def main():
         img_paths = [Path(p) for p in data["img_paths"]]
 
         # 0) Get predicted depth sequence from outputs
-        pred_depth = depth_from_outputs(outputs)  # [seq_len, H_pred, W_pred]
+        pred_depth = depth_from_outputs(preds)  # [seq_len, H_pred, W_pred]
 
         # 1) Load GT depth for each frame in this predicted sequence
         gt_depths = []
@@ -191,7 +198,7 @@ def main():
         eval_indices = get_horizon_indices(context_len, seq_len, args.horizon_mode)
 
         pr_eval = pr_depth_resized[eval_indices]  # [T_eval, H, W]
-        gt_eval = gt_depth[eval_indices]  # [T_eval, H, W]
+        gt_eval = gt_depth[eval_indices]          # [T_eval, H, W]
 
         # 4) Call depth_evaluation with appropriate alignment options
         align_with_lad2 = args.align == "scale&shift"
@@ -210,11 +217,34 @@ def main():
 
         gathered_metrics.append(results)
 
+    # ---- Sync metrics across GPUs ----
+    if world_size > 1:
+        # Gather lists of metric dicts from all ranks to rank 0
+        object_gather_list = [None for _ in range(world_size)] if rank == 0 else None
+        dist.gather_object(
+            gathered_metrics,
+            object_gather_list=object_gather_list,
+            dst=0,
+        )
+
+        if rank == 0:
+            merged = []
+            for lst in object_gather_list:
+                merged.extend(lst)
+            gathered_metrics = merged
+        else:
+            # Non-zero ranks are done after gather
+            return
+    else:
+        # Single process => nothing to sync
+        pass
+
+    # From here on: *only rank 0* (world_size == 1 or gathered from all)
     if len(gathered_metrics) == 0:
-        print(f"[Rank {rank}] No metrics computed.")
+        print("[Rank 0] No metrics computed.")
         return
 
-    # 5) Aggregate metrics using valid_pixels as weights (per rank)
+    # 5) Aggregate metrics using valid_pixels as weights (global)
     valid_pixels_list = [m["valid_pixels"] for m in gathered_metrics]
 
     avg_metrics = {
@@ -227,17 +257,15 @@ def main():
     }
 
     print(
-        f"\n[Rank {rank}] Aggregated depth metrics for "
+        f"\n[Rank 0] Aggregated depth metrics for "
         f"horizon_mode={args.horizon_mode}, align={args.align}:"
     )
     for k, v in avg_metrics.items():
-        print(f"[Rank {rank}]   {k}: {v:.6f}")
+        print(f"[Rank 0]   {k}: {v:.6f}")
 
-    # Optionally save per-rank metrics; you can merge them later
+    # Single global JSON, only from rank 0
     if args.output_metrics is not None:
-        base = Path(args.output_metrics)
-        # append rank so processes don't clobber each other
-        out_path = base.with_name(base.stem + f"_rank{rank}" + base.suffix)
+        out_path = Path(args.output_metrics)
         out_path.parent.mkdir(parents=True, exist_ok=True)
         with open(out_path, "w") as f:
             json.dump(
@@ -246,14 +274,12 @@ def main():
                     "horizon_mode": args.horizon_mode,
                     "align": args.align,
                     "max_depth": args.max_depth,
-                    "rank": rank,
-                    "world_size": world_size,
                     "metrics": avg_metrics,
                 },
                 f,
                 indent=2,
             )
-        print(f"[Rank {rank}] Saved metrics to {out_path}")
+        print(f"[Rank 0] Saved metrics to {out_path}")
 
 
 if __name__ == "__main__":

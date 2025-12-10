@@ -49,6 +49,13 @@ def parse_args():
         choices=["forecast", "copy_last", "oracle"]
     )
 
+    parser.add_argument(
+        "--seq_subsample",
+        type=int,
+        default=1,
+        help="Keep every N-th sequence per segment (1 = keep all)",
+    )
+
     # Sequence config
     parser.add_argument(
         "--img_size",
@@ -120,7 +127,7 @@ def prepare_views(img_paths, size, device):
     This matches the format they use in their eval code:
     each view has img, ray_map, true_shape, etc.
     """
-    images = load_images(img_paths, size=size, crop=True)
+    images = load_images(img_paths, size=size, crop=False, verbose=False)
     views = []
 
     for i, img_dict in enumerate(images):
@@ -226,6 +233,14 @@ def main():
         if len(sequences) == 0:
             print(f"[Rank {rank}] Warning: no valid sequences in segment {seg_name}")
             continue
+        
+        # Subsample sequences: keep every N-th
+        if args.seq_subsample > 1:
+            sequences = sequences[::args.seq_subsample]
+
+        print(
+            f"[Rank {rank}] {seg_name}: {len(sequences)} sequences after subsampling"
+        )
 
         seg_out_dir = Path(args.output_dir) / seg_name
         seg_out_dir.mkdir(parents=True, exist_ok=True)
@@ -256,7 +271,7 @@ def main():
                 "seq_len": args.seq_len,
                 "context_len": args.context_len,
                 "img_paths": img_paths,
-                "outputs": outputs,  # full inference result
+                "preds": preds,  # full inference result
             }
 
             out_path = seg_out_dir / f"seq_{start_frame_idx:05d}.pt"
