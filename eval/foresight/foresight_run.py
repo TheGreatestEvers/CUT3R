@@ -15,10 +15,8 @@ sys.path.append("/workspace/CUT3R/eval")
 from dust3r.utils.image import load_images_for_eval as load_images
 from dust3r.model import ARCroco3DStereo
 
-from eval.foresight.waymo_adapter import (
-    list_segments,
-    list_front_camera_frames,
-)
+import eval.foresight.waymo_adapter as waymo_adapter
+import eval.foresight.kitti_adapter as kitti_adapter
 
 sys.path.append("/workspace/DINO-Foresight")
 from src.dino_f import Dino_f
@@ -29,10 +27,17 @@ def parse_args():
 
     # Dataset & model
     parser.add_argument(
-        "--waymo_root",
+        "--data_root",
         type=str,
-        default="/workspace/raid/jevers/cut3r_processed_waymo/validation_full_res_depth/",
-        help="Waymo root directory containing segment subfolders",
+        default="/workspace/raid/jevers/kitti/depth_selection/val_selection_cropped",
+        help="Data root directory containing segment subfolders",
+    )
+
+    parser.add_argument(
+        "--dataset",
+        type=str,
+        default="kitti",
+        choices=["waymo", "kitti"]
     )
 
     parser.add_argument(
@@ -60,7 +65,7 @@ def parse_args():
     parser.add_argument(
         "--img_size",
         type=int,
-        default=224,
+        default=512,
         help="Image size for model input (as in your normal pipeline)",
     )
     parser.add_argument(
@@ -180,6 +185,14 @@ def main():
     args = parse_args()
     os.makedirs(args.output_dir, exist_ok=True)
 
+    # Get correct helpers for dataset
+    if args.dataset == "waymo":
+        list_segments = waymo_adapter.list_segments
+        list_front_camera_frames = waymo_adapter.list_front_camera_frames
+    elif args.dataset == "kitti":
+        list_segments = kitti_adapter.list_segments
+        list_front_camera_frames = kitti_adapter.list_front_camera_frames
+
     # ---- Multi-GPU device selection (torchrun-compatible) ----
     rank, world_size, local_rank = get_rank_and_world_size()
     if torch.cuda.is_available():
@@ -200,16 +213,32 @@ def main():
     if rank == 0:
         print("Loading Dino_f model...")
     args_dinof = torch.load("/workspace/DINO-Foresight/args.pt")
-    dinof_model = Dino_f.load_from_checkpoint(
-        "/workspace/epoch=87-step=59136-val_loss=0.00000.ckpt",
-        args=args_dinof,
-        strict=False,
-        map_location=device,
-    )
+
+    # Change positional encoding to match dataset
+    if args.dataset == "waymo":
+        # Make changes here 
+        args_dinof.feat_hw = (32,21)
+        dinof_model = Dino_f.load_from_checkpoint(
+            "/workspace/epoch=88-step=44322-val_loss=0.00000.ckpt",
+            args=args_dinof,
+            strict=False,
+            map_location=device,
+        )
+    elif args.dataset == "kitti":
+        # Make changes here
+        args_dinof.feat_hw = (32,9)
+        args_dinof.low_res_feat_hw = (32,21)
+        args_dinof.high_res_adapt_external = True
+        dinof_model = Dino_f.load_from_checkpoint(
+            "/workspace/epoch=88-step=44322-val_loss=0.00000.ckpt",
+            args=args_dinof,
+            strict=False,
+            map_location=device,
+        )
     dinof_model.to(device).eval()
 
     # List all segments (single global list, then shard by rank)
-    all_segments = list_segments(args.waymo_root)
+    all_segments = list_segments(args.data_root)
     if rank == 0:
         print(f"Found {len(all_segments)} total segments.")
 

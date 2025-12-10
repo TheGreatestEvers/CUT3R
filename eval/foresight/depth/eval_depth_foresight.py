@@ -16,26 +16,34 @@ sys.path.append("/workspace/CUT3R/src")
 sys.path.append("/workspace/CUT3R")
 
 from eval.video_depth.tools import depth_evaluation
-from eval.foresight.waymo_adapter import (
-    rgb_to_depth_path,
-    read_depth_exr,
-)
+
+import eval.foresight.waymo_adapter as waymo_adapter
+import eval.foresight.kitti_adapter as kitti_adapter
 
 
 def parse_args():
     parser = argparse.ArgumentParser()
 
     parser.add_argument(
-        "--waymo_root",
+        "--data_root",
         type=str,
         default="/workspace/raid/jevers/cut3r_processed_waymo/validation_full_res_depth",
-        help="Waymo root (not strictly needed yet, but kept for symmetry)",
+        help="Dataset root. For Waymo: segment folders. For KITTI: val_selection_cropped root.",
     )
+
+    parser.add_argument(
+        "--dataset",
+        type=str,
+        default="waymo",
+        choices=["waymo", "kitti"],
+        help="Which dataset was used to create the predictions.",
+    )
+
     parser.add_argument(
         "--pred_root",
         type=str,
         default="/workspace/raid/jevers/waymo_outputs/forecast_224",
-        help="Root where predictions are stored (output_dir from run script)",
+        help="Root where predictions are stored (output_dir from run script).",
     )
 
     parser.add_argument(
@@ -43,7 +51,7 @@ def parse_args():
         type=str,
         default="scale&shift",
         choices=["scale&shift", "scale", "metric"],
-        help="Alignment mode: passed to depth_evaluation",
+        help="Alignment mode: passed to depth_evaluation.",
     )
 
     parser.add_argument(
@@ -51,21 +59,21 @@ def parse_args():
         type=str,
         default="short",
         choices=["short", "middle", "long", "all"],
-        help="Which forecast horizon to evaluate across sequences",
+        help="Which forecast horizon to evaluate across sequences.",
     )
 
     parser.add_argument(
         "--max_depth",
         type=float,
         default=80.0,
-        help="Max depth considered valid (None for no clipping)",
+        help="Max depth considered valid (None for no clipping).",
     )
 
     parser.add_argument(
         "--output_metrics",
         type=str,
         default=None,
-        help="Optional JSON file to save aggregated metrics (single file, rank 0 only)",
+        help="Optional JSON file to save aggregated metrics (single file, rank 0 only).",
     )
 
     return parser.parse_args()
@@ -127,6 +135,24 @@ def maybe_init_distributed(world_size):
 def main():
     args = parse_args()
 
+    # ---- dataset-specific helpers ----
+    data_root = Path(args.data_root)
+
+    if args.dataset == "waymo":
+        rgb_to_depth_path_fn = waymo_adapter.rgb_to_depth_path
+        read_depth_fn = waymo_adapter.read_depth_exr
+
+    elif args.dataset == "kitti":
+        # For KITTI we want the version that maps from image_gathered ->
+        # groundtruth_depth_gathered under the same data_root.
+        def rgb_to_depth_path_fn(rgb_path: Path) -> Path:
+            return kitti_adapter.rgb_to_depth_path(rgb_path, data_root)
+
+        read_depth_fn = kitti_adapter.read_depth_kitti_png
+
+    else:
+        raise ValueError(f"Unknown dataset: {args.dataset}")
+
     # ---- Multi-GPU device selection (torchrun-compatible) ----
     rank, world_size, local_rank = get_rank_and_world_size()
     maybe_init_distributed(world_size)
@@ -139,12 +165,10 @@ def main():
     print(f"[Rank {rank}/{world_size}] Using device: {device}")
 
     pred_root = Path(args.pred_root)
-    # FIXED: pattern should not start with '/'
-    all_seq_files = sorted(pred_root.glob("*/*.pt"))
+    all_seq_files = sorted(pred_root.glob("/.pt"))
 
     if len(all_seq_files) == 0:
         print(f"[Rank {rank}] No seq_*.pt files found under {pred_root}")
-        # All ranks can safely exit
         return
 
     # ---- Multi-GPU sharding over sequences ----
@@ -174,8 +198,8 @@ def main():
         # 1) Load GT depth for each frame in this predicted sequence
         gt_depths = []
         for rgb_path in img_paths:
-            depth_path = rgb_to_depth_path(rgb_path)
-            depth = read_depth_exr(depth_path)
+            depth_path = rgb_to_depth_path_fn(rgb_path)
+            depth = read_depth_fn(depth_path)
             gt_depths.append(depth)
 
         gt_depth = np.stack(gt_depths, axis=0)  # [seq_len, H_gt, W_gt]
@@ -235,11 +259,8 @@ def main():
         else:
             # Non-zero ranks are done after gather
             return
-    else:
-        # Single process => nothing to sync
-        pass
 
-    # From here on: *only rank 0* (world_size == 1 or gathered from all)
+    # From here on: only rank 0 (world_size == 1 or gathered from all)
     if len(gathered_metrics) == 0:
         print("[Rank 0] No metrics computed.")
         return
@@ -258,7 +279,7 @@ def main():
 
     print(
         f"\n[Rank 0] Aggregated depth metrics for "
-        f"horizon_mode={args.horizon_mode}, align={args.align}:"
+        f"dataset={args.dataset}, horizon_mode={args.horizon_mode}, align={args.align}:"
     )
     for k, v in avg_metrics.items():
         print(f"[Rank 0]   {k}: {v:.6f}")
@@ -270,7 +291,7 @@ def main():
         with open(out_path, "w") as f:
             json.dump(
                 {
-                    "dataset": "waymo",
+                    "dataset": args.dataset,
                     "horizon_mode": args.horizon_mode,
                     "align": args.align,
                     "max_depth": args.max_depth,

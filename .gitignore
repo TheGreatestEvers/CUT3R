@@ -55,3 +55,4 @@ data
 src/checkpoints
 
 /output
+val_selection_cropped/
