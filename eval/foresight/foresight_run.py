@@ -29,14 +29,14 @@ def parse_args():
     parser.add_argument(
         "--data_root",
         type=str,
-        default="/workspace/raid/jevers/kitti/depth_selection/val_selection_cropped",
+        default="/workspace/raid/jevers/validation",
         help="Data root directory containing segment subfolders",
     )
 
     parser.add_argument(
         "--dataset",
         type=str,
-        default="kitti",
+        default="waymo",
         choices=["waymo", "kitti"]
     )
 
@@ -57,7 +57,7 @@ def parse_args():
     parser.add_argument(
         "--seq_subsample",
         type=int,
-        default=1,
+        default=6,
         help="Keep every N-th sequence per segment (1 = keep all)",
     )
 

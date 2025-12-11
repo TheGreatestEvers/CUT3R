@@ -27,7 +27,7 @@ def parse_args():
     parser.add_argument(
         "--data_root",
         type=str,
-        default="/workspace/raid/jevers/cut3r_processed_waymo/validation_full_res_depth",
+        default="/workspace/raid/jevers/validation",
         help="Dataset root. For Waymo: segment folders. For KITTI: val_selection_cropped root.",
     )
 
@@ -42,7 +42,7 @@ def parse_args():
     parser.add_argument(
         "--pred_root",
         type=str,
-        default="/workspace/raid/jevers/waymo_outputs/forecast_224",
+        default="/workspace/raid/jevers/waymo_outputs/oracle_512",
         help="Root where predictions are stored (output_dir from run script).",
     )
 
@@ -165,7 +165,7 @@ def main():
     print(f"[Rank {rank}/{world_size}] Using device: {device}")
 
     pred_root = Path(args.pred_root)
-    all_seq_files = sorted(pred_root.glob("/.pt"))
+    all_seq_files = sorted(pred_root.glob("*/*.pt"))
 
     if len(all_seq_files) == 0:
         print(f"[Rank {rank}] No seq_*.pt files found under {pred_root}")

@@ -1,0 +1,2 @@
+torchrun --nproc_per_node 8 depth/eval_depth_foresight.py --pred_root /workspace/raid/jevers/waymo_outputs/copylast_512 --output_metrics /workspace/raid/jevers/waymo_copylast_short.json
+torchrun --nproc_per_node 8 depth/eval_depth_foresight.py --pred_root /workspace/raid/jevers/waymo_outputs/copylast_512 --output_metrics /workspace/raid/jevers/waymo_copylast_mid.json --horizon_mode long
